@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import argparse
 import requests
 from bs4 import BeautifulSoup
@@ -24,15 +25,40 @@ if hasattr(sys.stderr, 'reconfigure'):
 # Define course page and resolve ntfy topic name
 COURSE_URL = os.environ.get("COURSE_URL", "").strip()
 DEFAULT_NTFY_TOPIC = os.environ.get("NTFY_TOPIC")
+STATE_FILE = "state/state.json"
+
+def load_state():
+    """Loads monitor state from state.json"""
+    state_dir = os.path.dirname(STATE_FILE)
+    if state_dir and not os.path.exists(state_dir):
+        os.makedirs(state_dir, exist_ok=True)
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"classes": {}, "last_error": None}
+
+def save_state(state):
+    """Saves monitor state to state.json"""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"Error saving state: {e}")
 
 def parse_availability(html_content):
     """
-    Parses the course page HTML and returns a dictionary of class details:
-    { class_number: { 'available': int, 'section': str, 'size': str } }
+    Parses the course page HTML and returns a dictionary of class details,
+    or None if no session wrappers exist (website markup changed).
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     sessions = soup.find_all(class_='cmp-course-accordion--container-session')
     
+    if not sessions:
+        return None
+        
     results = {}
     for session in sessions:
         cards = session.find_all(class_='cmp-course-accordion--card')
@@ -88,40 +114,88 @@ def send_notification(topic, title, message, priority="default", tags="bell"):
 def monitor_classes(topic, target_classes):
     """
     Fetches the course page, checks the targeted classes, and sends alerts if available.
+    Tracks state to deduplicate notifications and handle network/parse errors cleanly.
     """
+    state = load_state()
     print(f"Fetching course page: {COURSE_URL}")
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
+    
+    # 1. Fetch Course Page
     try:
         response = requests.get(COURSE_URL, headers=headers, timeout=15)
         response.raise_for_status()
     except Exception as e:
-        print(f"Failed to fetch course page: {e}")
-        # Notify user about check failure so they know if the monitor breaks
-        send_notification(
-            topic,
-            title="Monitor Error",
-            message=f"Failed to check course page: {e}",
-            priority="low",
-            tags="warning"
-        )
+        error_msg = str(e)
+        print(f"Failed to fetch course page: {error_msg}")
+        
+        # Notify once for this specific fetch error, then suppress further pings
+        if state.get("last_error") != error_msg:
+            send_notification(
+                topic,
+                title="Monitor Fetch Error",
+                message=f"Failed to check course page: {error_msg}",
+                priority="low",
+                tags="warning"
+            )
+            state["last_error"] = error_msg
+            save_state(state)
+        else:
+            print("Fetch error is identical to previous run. Notification suppressed.")
         return
 
+    # 2. Parse Course Page
     classes = parse_availability(response.text)
     
+    # 3. Sanity check: Ensure page structure has not changed
+    if classes is None:
+        print("Error: No class sessions found on the page. Website structure might have changed!")
+        parse_err = "parse_error_no_sessions"
+        if state.get("last_error") != parse_err:
+            send_notification(
+                topic,
+                title="Monitor Parsing Error",
+                message="No class sessions found on the course page. The website structure may have changed!",
+                priority="high",
+                tags="warning,exclamation"
+            )
+            state["last_error"] = parse_err
+            save_state(state)
+        else:
+            print("Parse error is identical to previous run. Notification suppressed.")
+        return
+        
+    # Clear any previous error status since fetch & parse succeeded
+    state["last_error"] = None
+    
+    # 4. Check target classes and compare with previous availability state
     available_alerts = []
+    state_changed = False
     
     for class_num in target_classes:
         if class_num in classes:
             details = classes[class_num]
-            status_msg = f"Class {class_num} ({details['section']}): {details['available']}/{details['size']} seats available."
-            print(status_msg)
+            current_available = details['available']
+            size = details['size']
+            section = details['section']
             
-            if details['available'] > 0:
+            print(f"Class {class_num} ({section}): {current_available}/{size} seats available.")
+            
+            # Retrieve previous availability from state
+            prev_available = state["classes"].get(class_num)
+            
+            # Notify only if seats are available AND it represents a change in count
+            if current_available > 0 and current_available != prev_available:
                 available_alerts.append(
-                    f"🟢 Class {class_num} ({details['section']}) has {details['available']} seat(s) available! (Size: {details['size']})"
+                    f"🟢 Class {class_num} ({section}) has {current_available} seat(s) available! (Size: {size})"
                 )
+                
+            # Update state if availability has changed
+            if prev_available != current_available:
+                state["classes"][class_num] = current_available
+                state_changed = True
         else:
             print(f"Warning: Target class {class_num} not found on the page.")
             
@@ -136,8 +210,11 @@ def monitor_classes(topic, target_classes):
             priority="high",
             tags="bell,warning,loud_sound"
         )
+        
+    if state_changed or state.get("last_error") is not None:
+        save_state(state)
     else:
-        print("No targeted classes are currently available.")
+        print("No state changes detected.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Monitor university course class availability.")
