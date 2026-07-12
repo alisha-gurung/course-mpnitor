@@ -43,7 +43,6 @@ jobs:
 
       - name: Save State Cache
         uses: actions/cache/save@v4
-        if: always() # Save cache even if script fails
         with:
           path: state
           key: monitor-state-${{ github.run_id }}
