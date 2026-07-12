@@ -37,12 +37,13 @@ jobs:
       - name: Run Availability Monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          COURSE_URL: ${{ vars.COURSE_URL }}
-          TARGET_CLASSES: ${{ vars.TARGET_CLASSES }}
+          COURSE_URL: ${{ secrets.COURSE_URL }}
+          TARGET_CLASSES: ${{ secrets.TARGET_CLASSES }}
         run: python monitor.py
 
       - name: Save State Cache
         uses: actions/cache/save@v4
+        if: always() # Save cache even if script fails
         with:
           path: state
           key: monitor-state-${{ github.run_id }}
